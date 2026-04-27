@@ -7,7 +7,7 @@ SETUP (Arch Linux):
   sudo pacman -S perl-image-exiftool python-xxhash
   pip install Pillow --break-system-packages   # optional, for JPEG fallback
 
-OUTPUT STRUCTURE (optimized for OneDrive / ProtonDrive):
+OUTPUT STRUCTURE (optimized for cloud storage):
   OUTPUT/
     2024/
       2024-06-15/
