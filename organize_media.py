@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 """
 organize_media.py — Organize photos & videos by creation date; remove duplicates.
-Optimized for Arch Linux with exiftool (perl-image-exiftool).
-
-SETUP (Arch Linux):
-  sudo pacman -S perl-image-exiftool python-xxhash
-  pip install Pillow --break-system-packages   # optional, for JPEG fallback
-
-OUTPUT STRUCTURE (optimized for OneDrive / ProtonDrive):
-  OUTPUT/
-    2024/
-      2024-06-15/
-        photo.jpg
-        video.mp4
-    duplicates/        <- moved here for review (use --delete-dupes to remove)
-    unorganized/       <- files where no date metadata could be found
 
 USAGE:
   python organize_media.py --input ~/Pictures --output ~/Organized --dry-run
