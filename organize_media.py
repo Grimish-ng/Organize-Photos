@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """
 organize_media.py — Organize photos & videos by creation date; remove duplicates.
+Optimized for Arch Linux with exiftool (perl-image-exiftool).
+
+SETUP (Arch Linux):
+  sudo pacman -S perl-image-exiftool python-xxhash
+  pip install Pillow --break-system-packages   # optional, for JPEG fallback
+
+OUTPUT STRUCTURE (optimized for OneDrive / ProtonDrive):
+  OUTPUT/
+    Photos/
+      2024/
+        2024-06-15/
+          photo.jpg
+    Videos/
+      2024/
+        2024-06-15/
+          video.mp4
+    duplicates/        <- moved here for review (use --delete-dupes to remove)
+    unorganized/
+      Photos/          <- images with no metadata date
+      Videos/          <- videos with no metadata date
+    organize_report.json
 
 USAGE:
   python organize_media.py --input ~/Pictures --output ~/Organized --dry-run
@@ -80,10 +101,19 @@ VIDEO_EXTS = {
 }
 ALL_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
+# Subfolder names for each media type
+MEDIA_SUBDIR = {
+    "photo": "Photos",
+    "video": "Videos",
+}
+
+def media_type(path: Path) -> str:
+    """Return 'photo' or 'video' based on file extension."""
+    return "video" if path.suffix.lower() in VIDEO_EXTS else "photo"
+
+
 # -- OneDrive-illegal filename characters -------------------------------------
-# Characters banned in OneDrive/SharePoint filenames (and Windows paths)
 _ONEDRIVE_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-# Names reserved on Windows (case-insensitive, with or without extension)
 _WINDOWS_RESERVED = re.compile(
     r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)', re.IGNORECASE
 )
@@ -92,31 +122,24 @@ def sanitize_filename(name: str) -> str:
     """
     Make a filename safe for OneDrive / Windows:
       - Replace illegal characters with '_'
-      - Strip leading/trailing spaces and dots (Windows dislikes them)
-      - Prefix reserved names with '_'
-      - Collapse multiple consecutive underscores introduced by substitution
+      - Strip leading/trailing spaces and dots
+      - Prefix Windows reserved names with '_'
+      - Collapse consecutive underscores introduced by substitution
     The file extension is preserved unchanged.
     """
-    # Split on the LAST dot so 'photo.jpg' -> stem='photo', suffix='.jpg'
-    # Special-case bare extensions like '.jpg' -> stem='', suffix='.jpg'
     dot = name.rfind('.')
     if dot > 0:
         stem, suffix = name[:dot], name[dot:]
-    elif dot == 0:          # e.g. '.jpg' — treat whole thing as an extension
+    elif dot == 0:          # bare extension e.g. '.jpg'
         stem, suffix = '', name
     else:
         stem, suffix = name, ''
 
-    # Replace illegal chars (includes control chars \x00-\x1f)
     stem = _ONEDRIVE_ILLEGAL.sub('_', stem)
-    # Collapse runs of underscores created by substitution
     stem = re.sub(r'_{2,}', '_', stem)
-    # Strip leading/trailing spaces, dots, and lone underscores left by stripping
     stem = stem.strip(' ._')
-    # Fall back to 'file' if stem is now empty
     if not stem:
         stem = 'file'
-    # Prefix Windows reserved names
     if _WINDOWS_RESERVED.match(stem):
         stem = '_' + stem
 
@@ -280,30 +303,25 @@ def get_creation_date(path: Path) -> tuple:
     """
     ext = path.suffix.lower()
 
-    # 1. exiftool - handles images, RAWs, all video formats, HEIC
     if _check_exiftool():
         dt = _exiftool_date(path)
         if dt:
             return dt, True
 
-    # 2. Pillow EXIF (JPEG/TIFF only) - fallback if exiftool missing
     if ext in {".jpg", ".jpeg", ".tiff", ".tif"}:
         dt = _date_from_pil(path)
         if dt:
             return dt, True
 
-    # 3. MP4/MOV QuickTime atom
     if ext in {".mp4", ".mov", ".m4v", ".3gp"}:
         dt = _date_from_mp4_box(path)
         if dt:
             return dt, True
 
-    # 4. Filename heuristic
     dt = _date_from_filename(path)
     if dt:
         return dt, True
 
-    # 5. Filesystem mtime - least reliable
     return datetime.fromtimestamp(path.stat().st_mtime), False
 
 
@@ -311,13 +329,17 @@ def get_creation_date(path: Path) -> tuple:
 
 def build_dest_path(output_root: Path, dt: datetime, source: Path) -> Path:
     """
-    Year / Year-Month-Day / filename  (3 levels — optimal for OneDrive)
-    e.g.  2024/2024-06-15/IMG_1234.jpg
+    Photos/ or Videos/ -> Year -> Year-Month-Day -> filename
+    e.g.  Photos/2024/2024-06-15/IMG_1234.jpg
+          Videos/2024/2024-06-15/clip.mp4
     Filename is sanitized for OneDrive/Windows compatibility.
     """
+    mtype     = media_type(source)
+    subdir    = MEDIA_SUBDIR[mtype]
     safe_name = sanitize_filename(source.name)
     return (
         output_root
+        / subdir
         / dt.strftime("%Y")
         / dt.strftime("%Y-%m-%d")
         / safe_name
@@ -341,7 +363,6 @@ def safe_transfer(src: Path, dest: Path, move: bool) -> None:
     """Copy or move, preserving all timestamps and permissions."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if move:
-        # shutil.move loses metadata on cross-device moves; do it manually
         shutil.copy2(src, dest)
         shutil.copystat(src, dest)
         src.unlink()
@@ -375,12 +396,17 @@ class MediaOrganizer:
         self._hash_lock = threading.Lock()
 
         self.stats = {
-            "total":       0,
-            "organized":   0,
-            "duplicates":  0,
-            "unorganized": 0,
-            "errors":      0,
+            "total":            0,
+            "photos_organized": 0,
+            "videos_organized": 0,
+            "duplicates":       0,
+            "unorganized":      0,
+            "errors":           0,
         }
+
+        # Detailed error log — written to the JSON report
+        self.error_details: list = []
+        self._errors_lock = threading.Lock()
 
     # -- Discovery ------------------------------------------------------------
 
@@ -427,24 +453,36 @@ class MediaOrganizer:
 
             # Date extraction
             dt, has_real_date = get_creation_date(src)
+            mtype = media_type(src)
 
             if has_real_date:
                 dest = build_dest_path(self.output_dir, dt, src)
-                result["action"] = "organized"
+                result["action"] = f"{mtype}s_organized"  # photos_organized / videos_organized
             else:
-                dest = self.output_dir / "unorganized" / sanitize_filename(src.name)
+                # No metadata — goes to unorganized/Photos/ or unorganized/Videos/
+                dest = (
+                    self.output_dir
+                    / "unorganized"
+                    / MEDIA_SUBDIR[mtype]
+                    / sanitize_filename(src.name)
+                )
                 result["action"] = "unorganized"
 
             dest = unique_path(dest)
             result["dest"] = dest
 
             if not self.dry_run:
-                safe_transfer(src, dest, self.move)
+                safe_transfer(src=src, dest=dest, move=self.move)
 
         except Exception as e:
             result["action"] = "errors"
             result["error"] = str(e)
             log.error(f"  ERROR processing {src.name}: {e}")
+            with self._errors_lock:
+                self.error_details.append({
+                    "file":   str(src),
+                    "reason": str(e),
+                })
 
         return result
 
@@ -490,7 +528,8 @@ class MediaOrganizer:
                     pct = done / len(files) * 100
                     log.info(
                         f"  {done:,}/{len(files):,} ({pct:.0f}%)  "
-                        f"organized={self.stats['organized']}  "
+                        f"photos={self.stats['photos_organized']}  "
+                        f"videos={self.stats['videos_organized']}  "
                         f"dupes={self.stats['duplicates']}  "
                         f"unorganized={self.stats['unorganized']}"
                     )
@@ -498,36 +537,47 @@ class MediaOrganizer:
         self._print_summary()
         if not self.dry_run:
             self._write_report()
+        elif self.error_details:
+            print("\n  ERRORS ENCOUNTERED:")
+            for e in self.error_details:
+                print(f"    {e['file']}")
+                print(f"      -> {e['reason']}")
 
     def _print_summary(self):
         s = self.stats
         verb = "Would move/copy" if self.dry_run else ("Moved" if self.move else "Copied")
-        print("\n" + "=" * 55)
+        total_organized = s['photos_organized'] + s['videos_organized']
+        print("\n" + "=" * 60)
         print("  ORGANIZE MEDIA - SUMMARY")
-        print("=" * 55)
+        print("=" * 60)
         print(f"  Total files scanned  : {s['total']:>7,}")
-        print(f"  {verb:<21s}: {s['organized']:>7,}")
+        print(f"  {verb:<21s}: {total_organized:>7,}")
+        print(f"    Photos             : {s['photos_organized']:>7,}  -> {self.output_dir}/Photos/")
+        print(f"    Videos             : {s['videos_organized']:>7,}  -> {self.output_dir}/Videos/")
         dupes_note = "(deleted)" if self.delete_dupes else f"-> {self.output_dir}/duplicates/"
         print(f"  Duplicates           : {s['duplicates']:>7,}  {dupes_note}")
         print(f"  No metadata (mtime)  : {s['unorganized']:>7,}  -> {self.output_dir}/unorganized/")
         print(f"  Errors               : {s['errors']:>7,}")
-        print("=" * 55)
+        print("=" * 60)
+        if s["errors"] and not self.dry_run:
+            print(f"\n  Error details saved to organize_report.json")
         if s["duplicates"] and not self.delete_dupes:
             print(f"\n  Review duplicates/ before deleting.")
             print(f"  Re-run with --delete-dupes to remove them automatically.")
         if s["unorganized"]:
             print(f"\n  {s['unorganized']} file(s) had no EXIF/metadata date.")
-            print(f"  Check unorganized/ and tag or rename them manually.")
+            print(f"  Check unorganized/Photos/ and unorganized/Videos/ and tag or rename them manually.")
         print()
 
     def _write_report(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         report = {
-            "run_at": datetime.now().isoformat(),
-            "input":  str(self.input_dir),
-            "output": str(self.output_dir),
-            "move":   self.move,
-            "stats":  self.stats,
+            "run_at":  datetime.now().isoformat(),
+            "input":   str(self.input_dir),
+            "output":  str(self.output_dir),
+            "move":    self.move,
+            "stats":   self.stats,
+            "errors":  self.error_details,
         }
         path = self.output_dir / "organize_report.json"
         with open(path, "w") as f:
